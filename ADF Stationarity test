@@ -1,0 +1,22 @@
+from statsmodels.tsa.stattools import adfuller
+
+def check_stationarity(timeseries):
+    print("--- Augmented Dickey-Fuller Test Results ---")
+    # Perform ADF test
+    result = adfuller(timeseries.dropna(), autolag='AIC')
+    
+    labels = ['ADF Statistic', 'p-value', '#Lags Used', 'Number of Observations Used']
+    for value, label in zip(result, labels):
+        print(f'{label}: {value:.4f}')
+
+    for key, value in result[4].items():
+        print(f'Critical Value ({key}): {value:.4f}')
+
+    # Interpret the p-value
+    if result[1] <= 0.05:
+        print("\nResult: The data is STATIONARY (Reject H0).")
+    else:
+        print("\nResult: The data is NON-STATIONARY (Fail to reject H0).")
+
+# Apply to your series
+check_stationarity(series)
