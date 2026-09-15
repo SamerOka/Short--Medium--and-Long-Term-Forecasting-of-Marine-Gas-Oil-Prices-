@@ -1,0 +1,914 @@
+# ============================================================
+# ARIMA ROLLING-ORIGIN / WALK-FORWARD FORECASTING
+# 12-WEEK-AHEAD DIRECT MULTI-STEP FORECASTING
+#
+# Model:
+#       ARIMA(1,2,1)
+#
+# Forecast horizon:
+#       12 weeks
+#
+# Forecast origin:
+#       Moves forward one week at a time
+#
+# Model estimation:
+#       Re-estimated at every forecast origin
+#
+# Estimation window:
+#       Expanding window
+# ============================================================
+
+
+# ============================================================
+# 1. IMPORT LIBRARIES
+# ============================================================
+
+import pandas as pd
+import numpy as np
+
+from statsmodels.tsa.arima.model import ARIMA
+
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score
+)
+
+import matplotlib.pyplot as plt
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# 2. LOAD DATA
+# ============================================================
+
+data = pd.read_csv(
+    "MGO Forecasting MARCH.csv"
+)
+
+data.columns = data.columns.str.strip()
+
+
+# ============================================================
+# 3. IDENTIFY DATE COLUMN
+# ============================================================
+
+first_column = data.columns[0]
+
+try:
+
+    data[first_column] = pd.to_datetime(
+        data[first_column]
+    )
+
+    data.set_index(
+        first_column,
+        inplace=True
+    )
+
+except Exception:
+
+    # If no valid date column exists,
+    # create a weekly date index.
+
+    data.index = pd.date_range(
+        start="1990-01-01",
+        periods=len(data),
+        freq="W"
+    )
+
+
+# ============================================================
+# 4. IDENTIFY TARGET VARIABLE
+# ============================================================
+
+target_column = data.columns[-1]
+
+series = pd.to_numeric(
+    data[target_column],
+    errors="coerce"
+)
+
+
+print("\nTarget variable:")
+print(target_column)
+
+print(
+    "\nNumber of observations:",
+    len(series)
+)
+
+
+# ============================================================
+# 5. HANDLE MISSING VALUES
+# ============================================================
+
+series = (
+    series
+    .interpolate(method="linear")
+    .bfill()
+    .ffill()
+)
+
+
+# ============================================================
+# 6. TRAIN / VALIDATION / TEST SPLIT
+#
+# 70% TRAIN
+# 10% VALIDATION
+# 20% TEST
+# ============================================================
+
+n = len(series)
+
+train_size = int(
+    n * 0.70
+)
+
+val_size = int(
+    n * 0.10
+)
+
+
+train = series.iloc[
+    :train_size
+]
+
+
+validation = series.iloc[
+    train_size:
+    train_size + val_size
+]
+
+
+test = series.iloc[
+    train_size + val_size:
+]
+
+
+# Initial estimation sample
+# = training + validation
+
+train_val = pd.concat(
+    [
+        train,
+        validation
+    ]
+)
+
+
+print("\n")
+print("=" * 60)
+print("DATA SPLIT")
+print("=" * 60)
+
+print(
+    "Total observations:",
+    len(series)
+)
+
+print(
+    "Training:",
+    len(train)
+)
+
+print(
+    "Validation:",
+    len(validation)
+)
+
+print(
+    "Test:",
+    len(test)
+)
+
+print(
+    "Initial estimation sample:",
+    len(train_val)
+)
+
+
+# ============================================================
+# 7. ARIMA PARAMETERS
+# ============================================================
+
+p = 1
+d = 2
+q = 1
+
+
+# ============================================================
+# 8. FORECAST HORIZON
+# ============================================================
+
+MAX_HORIZON = 12
+
+
+# ============================================================
+# 9. STORAGE FOR FORECAST RESULTS
+# ============================================================
+
+forecast_records = []
+
+origin_records = []
+
+
+# ============================================================
+# 10. WALK-FORWARD / ROLLING-ORIGIN FORECASTING
+# ============================================================
+#
+# At every forecast origin:
+#
+# 1. Use all observations available up to that origin.
+# 2. Re-estimate ARIMA(1,2,1).
+# 3. Generate a 12-week-ahead forecast.
+# 4. Compare the forecasts with the actual observations.
+# 5. Reveal the next actual observation.
+# 6. Move the origin forward one week.
+#
+# ============================================================
+
+history = train_val.copy()
+
+test_position = 0
+
+
+while test_position < len(test):
+
+
+    # ========================================================
+    # CURRENT FORECAST ORIGIN
+    # ========================================================
+
+    forecast_origin = history.index[-1]
+
+
+    print("\n")
+    print("=" * 60)
+
+    print(
+        "Forecast origin:",
+        forecast_origin
+    )
+
+    print(
+        "Historical observations:",
+        len(history)
+    )
+
+    print("=" * 60)
+
+
+    # ========================================================
+    # 11. FIT ARIMA MODEL
+    #
+    # IMPORTANT:
+    # Model is RE-ESTIMATED at every forecast origin.
+    # ========================================================
+
+    model = ARIMA(
+        history,
+        order=(p, d, q)
+    )
+
+
+    model_fit = model.fit()
+
+
+    # ========================================================
+    # 12. GENERATE 12-WEEK-AHEAD FORECAST
+    # ========================================================
+
+    forecast = model_fit.forecast(
+        steps=MAX_HORIZON
+    )
+
+
+    # ========================================================
+    # 13. GET THE ACTUAL OBSERVATIONS
+    #
+    # At the end of the test period, fewer than 12
+    # observations may remain.
+    # ========================================================
+
+    actual_end = min(
+        test_position + MAX_HORIZON,
+        len(test)
+    )
+
+
+    actual = test.iloc[
+        test_position:
+        actual_end
+    ]
+
+
+    # Only compare the forecast values for which
+    # actual observations are available.
+
+    forecast = forecast.iloc[
+        :len(actual)
+    ]
+
+
+    # ========================================================
+    # 14. STORE EACH FORECAST
+    # ========================================================
+
+    for h in range(
+        len(actual)
+    ):
+
+        forecast_date = actual.index[h]
+
+        actual_value = actual.iloc[h]
+
+        forecast_value = forecast.iloc[h]
+
+
+        forecast_records.append({
+
+            "Forecast_Origin":
+                forecast_origin,
+
+            "Forecast_Date":
+                forecast_date,
+
+            "Horizon_Week":
+                h + 1,
+
+            "Actual":
+                actual_value,
+
+            "Forecast":
+                forecast_value,
+
+            "Error":
+                actual_value
+                -
+                forecast_value,
+
+            "Absolute_Error":
+                abs(
+                    actual_value
+                    -
+                    forecast_value
+                )
+        })
+
+
+    # ========================================================
+    # 15. SAVE ORIGIN INFORMATION
+    # ========================================================
+
+    origin_records.append({
+
+        "Forecast_Origin":
+            forecast_origin,
+
+        "Historical_Observations":
+            len(history),
+
+        "Forecast_Horizon":
+            MAX_HORIZON,
+
+        "Model":
+            f"ARIMA({p},{d},{q})",
+
+        "Model_Reestimated":
+            True
+    })
+
+
+    # ========================================================
+    # 16. WALK FORWARD ONE WEEK
+    #
+    # Reveal ONLY the next actual observation.
+    #
+    # This observation becomes available at the next
+    # forecast origin.
+    # ========================================================
+
+    next_observation = test.iloc[
+        test_position:
+        test_position + 1
+    ]
+
+
+    history = pd.concat(
+        [
+            history,
+            next_observation
+        ]
+    )
+
+
+    # Move forecast origin forward by one week.
+
+    test_position += 1
+
+
+# ============================================================
+# 17. CREATE RESULTS DATAFRAME
+# ============================================================
+
+results = pd.DataFrame(
+    forecast_records
+)
+
+
+# ============================================================
+# 18. SORT RESULTS
+# ============================================================
+
+results = results.sort_values(
+    [
+        "Forecast_Origin",
+        "Horizon_Week"
+    ]
+).reset_index(
+    drop=True
+)
+
+
+print("\n")
+print("=" * 60)
+
+print(
+    "WALK-FORWARD FORECASTING COMPLETED"
+)
+
+print("=" * 60)
+
+print(
+    "Total forecast observations:",
+    len(results)
+)
+
+
+# ============================================================
+# 19. CALCULATE HORIZON-SPECIFIC METRICS
+# ============================================================
+
+metrics_list = []
+
+
+for h in range(
+    1,
+    MAX_HORIZON + 1
+):
+
+
+    h_data = results[
+        results[
+            "Horizon_Week"
+        ] == h
+    ].copy()
+
+
+    if len(h_data) == 0:
+        continue
+
+
+    actual_h = h_data[
+        "Actual"
+    ].values
+
+
+    forecast_h = h_data[
+        "Forecast"
+    ].values
+
+
+    # --------------------------------------------------------
+    # MAE
+    # --------------------------------------------------------
+
+    mae = mean_absolute_error(
+        actual_h,
+        forecast_h
+    )
+
+
+    # --------------------------------------------------------
+    # MSE
+    # --------------------------------------------------------
+
+    mse = mean_squared_error(
+        actual_h,
+        forecast_h
+    )
+
+
+    # --------------------------------------------------------
+    # RMSE
+    # --------------------------------------------------------
+
+    rmse = np.sqrt(
+        mse
+    )
+
+
+    # --------------------------------------------------------
+    # MAPE
+    #
+    # Exclude zero actual observations.
+    # --------------------------------------------------------
+
+    nonzero = (
+        actual_h != 0
+    )
+
+
+    if np.any(nonzero):
+
+        mape = (
+
+            np.mean(
+
+                np.abs(
+
+                    (
+                        actual_h[nonzero]
+                        -
+                        forecast_h[nonzero]
+                    )
+                    /
+                    actual_h[nonzero]
+                )
+            )
+            * 100
+        )
+
+    else:
+
+        mape = np.nan
+
+
+    # --------------------------------------------------------
+    # R-SQUARED
+    # --------------------------------------------------------
+
+    if len(actual_h) > 1:
+
+        try:
+
+            r2 = r2_score(
+                actual_h,
+                forecast_h
+            )
+
+        except Exception:
+
+            r2 = np.nan
+
+    else:
+
+        r2 = np.nan
+
+
+    metrics_list.append({
+
+        "Horizon":
+            h,
+
+        "MAE":
+            mae,
+
+        "MSE":
+            mse,
+
+        "RMSE":
+            rmse,
+
+        "MAPE":
+            mape,
+
+        "R2":
+            r2,
+
+        "N_Forecasts":
+            len(h_data)
+    })
+
+
+# ============================================================
+# 20. METRICS DATAFRAME
+# ============================================================
+
+metrics_df = pd.DataFrame(
+    metrics_list
+)
+
+
+# ============================================================
+# 21. OVERALL METRICS
+# ============================================================
+
+overall_actual = results[
+    "Actual"
+].values
+
+
+overall_forecast = results[
+    "Forecast"
+].values
+
+
+overall_mae = mean_absolute_error(
+    overall_actual,
+    overall_forecast
+)
+
+
+overall_mse = mean_squared_error(
+    overall_actual,
+    overall_forecast
+)
+
+
+overall_rmse = np.sqrt(
+    overall_mse
+)
+
+
+nonzero = (
+    overall_actual != 0
+)
+
+
+if np.any(nonzero):
+
+    overall_mape = (
+
+        np.mean(
+
+            np.abs(
+
+                (
+                    overall_actual[nonzero]
+                    -
+                    overall_forecast[nonzero]
+                )
+                /
+                overall_actual[nonzero]
+            )
+        )
+        * 100
+    )
+
+else:
+
+    overall_mape = np.nan
+
+
+try:
+
+    overall_r2 = r2_score(
+        overall_actual,
+        overall_forecast
+    )
+
+except Exception:
+
+    overall_r2 = np.nan
+
+
+overall_metrics = pd.DataFrame({
+
+    "Metric": [
+
+        "MAE",
+        "MSE",
+        "RMSE",
+        "MAPE",
+        "R2"
+    ],
+
+    "Value": [
+
+        overall_mae,
+        overall_mse,
+        overall_rmse,
+        overall_mape,
+        overall_r2
+    ]
+})
+
+
+# ============================================================
+# 22. PRINT RESULTS
+# ============================================================
+
+print("\n")
+print("=" * 60)
+
+print(
+    "HORIZON-SPECIFIC ACCURACY"
+)
+
+print("=" * 60)
+
+print(
+    metrics_df.to_string(
+        index=False
+    )
+)
+
+
+print("\n")
+print("=" * 60)
+
+print(
+    "OVERALL ACCURACY"
+)
+
+print("=" * 60)
+
+print(
+    overall_metrics.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# 23. FORECAST ORIGIN INFORMATION
+# ============================================================
+
+origin_df = pd.DataFrame(
+    origin_records
+)
+
+
+# ============================================================
+# 24. SAVE RESULTS TO EXCEL
+# ============================================================
+
+output_file = (
+    "ARIMA_12week_WalkForward_Results.xlsx"
+)
+
+
+with pd.ExcelWriter(
+    output_file,
+    engine="openpyxl"
+) as writer:
+
+
+    # --------------------------------------------------------
+    # All forecasts
+    # --------------------------------------------------------
+
+    results.to_excel(
+
+        writer,
+
+        sheet_name="Forecasts",
+
+        index=False
+    )
+
+
+    # --------------------------------------------------------
+    # Horizon-specific metrics
+    # --------------------------------------------------------
+
+    metrics_df.to_excel(
+
+        writer,
+
+        sheet_name="Horizon_Metrics",
+
+        index=False
+    )
+
+
+    # --------------------------------------------------------
+    # Overall metrics
+    # --------------------------------------------------------
+
+    overall_metrics.to_excel(
+
+        writer,
+
+        sheet_name="Overall_Metrics",
+
+        index=False
+    )
+
+
+    # --------------------------------------------------------
+    # Forecast-origin information
+    # --------------------------------------------------------
+
+    origin_df.to_excel(
+
+        writer,
+
+        sheet_name="Forecast_Origins",
+
+        index=False
+    )
+
+
+print("\n")
+print("=" * 60)
+
+print(
+    "RESULTS SAVED SUCCESSFULLY"
+)
+
+print("=" * 60)
+
+print(
+    output_file
+)
+
+
+# ============================================================
+# 25. PLOT
+# ============================================================
+
+plt.figure(
+    figsize=(14, 6)
+)
+
+
+# Historical data
+
+plt.plot(
+    train_val.index,
+    train_val.values,
+    label="Train + Validation"
+)
+
+
+# Actual test observations
+
+plt.plot(
+    test.index,
+    test.values,
+    label="Test",
+    color="black"
+)
+
+
+# ------------------------------------------------------------
+# Plot selected forecast horizons
+# ------------------------------------------------------------
+#
+# We plot the 1-week, 6-week and 12-week forecasts.
+# These are collected from ALL rolling forecast origins.
+#
+# ------------------------------------------------------------
+
+for h in [1, 6, 12]:
+
+    h_data = results[
+        results[
+            "Horizon_Week"
+        ] == h
+    ]
+
+
+    if len(h_data) > 0:
+
+        plt.plot(
+
+            h_data[
+                "Forecast_Date"
+            ],
+
+            h_data[
+                "Forecast"
+            ],
+
+            label=f"{h}-week-ahead forecast"
+        )
+
+
+plt.xlabel(
+    "Date"
+)
+
+plt.ylabel(
+    target_column
+)
+
+plt.title(
+    "ARIMA Rolling-Origin / Walk-Forward "
+    "12-Week-Ahead Forecasting"
+)
+
+plt.legend()
+
+plt.grid(
+    alpha=0.3
+)
+
+plt.tight_layout()
+
+plt.show()
