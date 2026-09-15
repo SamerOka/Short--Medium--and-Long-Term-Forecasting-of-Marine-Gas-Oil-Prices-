@@ -1,0 +1,806 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+# ============================================================
+# 1. Load Data
+# ============================================================
+
+data = pd.read_csv("MGO Forecasting MARCH.csv")
+data.columns = data.columns.str.strip()
+
+# Handle datetime index
+if 'date' in data.columns[0].lower():
+    data.iloc[:, 0] = pd.to_datetime(data.iloc[:, 0])
+    data.set_index(data.columns[0], inplace=True)
+else:
+    data.index = pd.date_range(
+        start='1990-01-01',
+        periods=len(data),
+        freq='W'
+    )
+
+# Target = last column
+target_column = data.columns[-1]
+
+# Convert all variables to numeric
+for col in data.columns:
+    data[col] = (
+        data[col]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .astype(float)
+    )
+
+
+# ============================================================
+# 2. Train / Validation / Test Split
+# ============================================================
+
+n = len(data)
+
+train_size = int(n * 0.70)
+val_size = int(n * 0.10)
+
+train = data.iloc[:train_size]
+
+validation = data.iloc[
+    train_size:train_size + val_size
+]
+
+test = data.iloc[
+    train_size + val_size:
+]
+
+# Initial historical information available
+history_data = pd.concat(
+    [train, validation]
+)
+
+print("==============================================")
+print("DATA SPLIT")
+print("==============================================")
+print("Total observations:", n)
+print("Training:", len(train))
+print("Validation:", len(validation))
+print("Test:", len(test))
+
+
+# ============================================================
+# 3. Parameters
+# ============================================================
+
+SEQ_LEN = 24          # 24 weeks of historical observations
+HORIZON = 12          # 12-week-ahead forecast
+STEP = 1              # move forward one week at a time
+
+EPOCHS = 50
+BATCH_SIZE = 16
+
+N_TOP_FEATURES = None     # Use all features
+
+
+# ============================================================
+# 4. Create Multivariate Direct Multi-Step Sequences
+# ============================================================
+
+def create_sequences(
+    scaled_data,
+    seq_len,
+    horizon
+):
+
+    X = []
+    y = []
+
+    for i in range(
+        len(scaled_data) - seq_len - horizon + 1
+    ):
+
+        # Historical explanatory variables
+        X.append(
+            scaled_data[
+                i:i + seq_len,
+                :-1
+            ]
+        )
+
+        # Future target values
+        y.append(
+            scaled_data[
+                i + seq_len:
+                i + seq_len + horizon,
+                -1
+            ]
+        )
+
+    return np.array(X), np.array(y)
+
+
+# ============================================================
+# 5. Build LSTM Model
+# ============================================================
+
+def build_lstm_model(
+    seq_len,
+    n_features,
+    horizon
+):
+
+    model = Sequential([
+
+        LSTM(
+            64,
+            activation='tanh',
+            return_sequences=True,
+            input_shape=(seq_len, n_features)
+        ),
+
+        Dropout(0.2),
+
+        LSTM(
+            32,
+            activation='tanh'
+        ),
+
+        Dropout(0.2),
+
+        # 12 outputs = 12 weeks ahead
+        Dense(horizon)
+
+    ])
+
+    model.compile(
+        optimizer='adam',
+        loss='mse'
+    )
+
+    return model
+
+
+# ============================================================
+# 6. Inverse Transform Target
+# ============================================================
+
+def inverse_target_multistep(
+    scaled_target,
+    target_scaler
+):
+
+    return target_scaler.inverse_transform(
+        scaled_target
+    )
+
+
+# ============================================================
+# 7. Rolling / Walk-Forward Forecasting
+# ============================================================
+
+forecast_results = []
+forecast_origins = []
+
+test_position = 0
+
+
+while test_position <= len(test) - HORIZON:
+
+    print("\n==============================================")
+    print(
+        f"Forecast origin {test_position + 1} "
+        f"of {len(test) - HORIZON + 1}"
+    )
+    print("==============================================")
+
+
+    # --------------------------------------------------------
+    # Current forecast origin
+    # --------------------------------------------------------
+
+    forecast_origin = history_data.index[-1]
+
+    print(
+        "Forecast origin:",
+        forecast_origin
+    )
+
+
+    # --------------------------------------------------------
+    # Historical data available at this origin
+    # --------------------------------------------------------
+
+    current_history = history_data.copy()
+
+
+    # --------------------------------------------------------
+    # Handle missing values using historical information only
+    # --------------------------------------------------------
+
+    current_history = (
+        current_history
+        .interpolate(method='linear')
+        .bfill()
+        .ffill()
+    )
+
+
+    # --------------------------------------------------------
+    # Separate features and target
+    # --------------------------------------------------------
+
+    feature_columns = [
+        col for col in current_history.columns
+        if col != target_column
+    ]
+
+    X_history_raw = current_history[
+        feature_columns
+    ].values
+
+    y_history_raw = current_history[
+        [target_column]
+    ].values
+
+
+    # --------------------------------------------------------
+    # Fit scalers ONLY on historical data
+    # --------------------------------------------------------
+
+    X_scaler = MinMaxScaler(
+        feature_range=(0, 1)
+    )
+
+    y_scaler = MinMaxScaler(
+        feature_range=(0, 1)
+    )
+
+
+    X_scaled = X_scaler.fit_transform(
+        X_history_raw
+    )
+
+    y_scaled = y_scaler.fit_transform(
+        y_history_raw
+    )
+
+
+    # Combine scaled features and target
+    scaled_history = np.column_stack(
+        [
+            X_scaled,
+            y_scaled
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # Create training sequences
+    # --------------------------------------------------------
+
+    X_train, y_train = create_sequences(
+        scaled_history,
+        SEQ_LEN,
+        HORIZON
+    )
+
+
+    # --------------------------------------------------------
+    # Check sufficient observations
+    # --------------------------------------------------------
+
+    if len(X_train) == 0:
+
+        print(
+            "Not enough historical observations."
+        )
+
+        break
+
+
+    n_features = X_train.shape[2]
+
+
+    # --------------------------------------------------------
+    # Build a NEW LSTM at every forecast origin
+    # --------------------------------------------------------
+
+    model = build_lstm_model(
+        SEQ_LEN,
+        n_features,
+        HORIZON
+    )
+
+
+    # --------------------------------------------------------
+    # Early stopping
+    # --------------------------------------------------------
+
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=8,
+        restore_best_weights=True
+    )
+
+
+    # --------------------------------------------------------
+    # Train / re-estimate model
+    # --------------------------------------------------------
+
+    model.fit(
+        X_train,
+        y_train,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=0.10,
+        shuffle=False,
+        callbacks=[early_stopping],
+        verbose=0
+    )
+
+
+    # ========================================================
+    # 8. Prepare the next 12 weeks
+    # ========================================================
+
+    future_test = test.iloc[
+        test_position:
+        test_position + HORIZON
+    ]
+
+
+    # --------------------------------------------------------
+    # We need the last 24 historical observations
+    # before generating the 12-week forecast
+    # --------------------------------------------------------
+
+    last_history = current_history.iloc[
+        -SEQ_LEN:
+    ]
+
+
+    # --------------------------------------------------------
+    # Scale historical observations using the
+    # current-origin scalers
+    # --------------------------------------------------------
+
+    last_X_scaled = X_scaler.transform(
+        last_history[feature_columns].values
+    )
+
+
+    # --------------------------------------------------------
+    # Last target values are not used as predictors here,
+    # because the LSTM input consists of the explanatory
+    # variables.
+    # --------------------------------------------------------
+
+    X_forecast = last_X_scaled.reshape(
+        1,
+        SEQ_LEN,
+        n_features
+    )
+
+
+    # ========================================================
+    # 9. Generate 12-week-ahead forecast
+    # ========================================================
+
+    forecast_scaled = model.predict(
+        X_forecast,
+        verbose=0
+    )
+
+
+    # Convert predictions back to original units
+    forecast = inverse_target_multistep(
+        forecast_scaled,
+        y_scaler
+    )[0]
+
+
+    # Actual observations
+    actual = future_test[
+        target_column
+    ].values
+
+
+    # ========================================================
+    # 10. Store Forecast Results
+    # ========================================================
+
+    for h in range(HORIZON):
+
+        forecast_results.append({
+
+            'Forecast_Origin':
+                forecast_origin,
+
+            'Forecast_Date':
+                future_test.index[h],
+
+            'Horizon_Week':
+                h + 1,
+
+            'Actual':
+                actual[h],
+
+            'Forecast':
+                forecast[h],
+
+            'Error':
+                actual[h] - forecast[h],
+
+            'Absolute_Error':
+                abs(
+                    actual[h] - forecast[h]
+                )
+
+        })
+
+
+    forecast_origins.append({
+
+        'Forecast_Origin':
+            forecast_origin,
+
+        'Forecast_Start':
+            future_test.index[0],
+
+        'Forecast_End':
+            future_test.index[-1]
+
+    })
+
+
+    # ========================================================
+    # 11. Walk Forward
+    # ========================================================
+
+    # Add ONLY the next observed value to the history.
+    #
+    # This is important:
+    # We do NOT add all 12 future observations at once.
+    # Only one new observation becomes available before
+    # the next model re-estimation.
+
+    next_observation = test.iloc[
+        test_position
+    ]
+
+    history_data = pd.concat(
+        [
+            history_data,
+            pd.DataFrame(
+                [next_observation],
+                index=[test.index[test_position]]
+            )
+        ]
+    )
+
+
+    # Move forecast origin forward one week
+    test_position += STEP
+
+
+# ============================================================
+# 12. Convert Results to DataFrame
+# ============================================================
+
+forecast_df = pd.DataFrame(
+    forecast_results
+)
+
+origins_df = pd.DataFrame(
+    forecast_origins
+)
+
+
+# ============================================================
+# 13. Calculate Metrics for Each Horizon
+# ============================================================
+
+metrics_list = []
+
+
+for h in range(
+    1,
+    HORIZON + 1
+):
+
+    horizon_data = forecast_df[
+        forecast_df['Horizon_Week'] == h
+    ]
+
+
+    actual_h = horizon_data[
+        'Actual'
+    ]
+
+    forecast_h = horizon_data[
+        'Forecast'
+    ]
+
+
+    mae = mean_absolute_error(
+        actual_h,
+        forecast_h
+    )
+
+
+    mse = mean_squared_error(
+        actual_h,
+        forecast_h
+    )
+
+
+    rmse = np.sqrt(mse)
+
+
+    # Avoid division by zero
+    non_zero = actual_h != 0
+
+    if non_zero.any():
+
+        mape = np.mean(
+            np.abs(
+                (
+                    actual_h[non_zero]
+                    - forecast_h[non_zero]
+                )
+                /
+                actual_h[non_zero]
+            )
+        ) * 100
+
+    else:
+
+        mape = np.nan
+
+
+    r2 = r2_score(
+        actual_h,
+        forecast_h
+    )
+
+
+    metrics_list.append({
+
+        'Horizon_Week': h,
+
+        'MAE': mae,
+
+        'MSE': mse,
+
+        'RMSE': rmse,
+
+        'MAPE': mape,
+
+        'R2': r2,
+
+        'Number_of_Forecasts':
+            len(horizon_data)
+
+    })
+
+
+metrics_df = pd.DataFrame(
+    metrics_list
+)
+
+
+# ============================================================
+# 14. Overall Metrics
+# ============================================================
+
+overall_actual = forecast_df[
+    'Actual'
+]
+
+overall_forecast = forecast_df[
+    'Forecast'
+]
+
+
+overall_mae = mean_absolute_error(
+    overall_actual,
+    overall_forecast
+)
+
+
+overall_mse = mean_squared_error(
+    overall_actual,
+    overall_forecast
+)
+
+
+overall_rmse = np.sqrt(
+    overall_mse
+)
+
+
+non_zero = overall_actual != 0
+
+
+if non_zero.any():
+
+    overall_mape = np.mean(
+        np.abs(
+            (
+                overall_actual[non_zero]
+                -
+                overall_forecast[non_zero]
+            )
+            /
+            overall_actual[non_zero]
+        )
+    ) * 100
+
+else:
+
+    overall_mape = np.nan
+
+
+overall_r2 = r2_score(
+    overall_actual,
+    overall_forecast
+)
+
+
+overall_metrics_df = pd.DataFrame([{
+
+    'MAE':
+        overall_mae,
+
+    'MSE':
+        overall_mse,
+
+    'RMSE':
+        overall_rmse,
+
+    'MAPE':
+        overall_mape,
+
+    'R2':
+        overall_r2,
+
+    'Number_of_Forecasts':
+        len(forecast_df)
+
+}])
+
+
+# ============================================================
+# 15. Save Results
+# ============================================================
+
+output_file = (
+    'LSTM_Multivariate_12week_WalkForward.xlsx'
+)
+
+
+with pd.ExcelWriter(
+    output_file,
+    engine='openpyxl'
+) as writer:
+
+    forecast_df.to_excel(
+        writer,
+        sheet_name='Forecasts',
+        index=False
+    )
+
+    metrics_df.to_excel(
+        writer,
+        sheet_name='Horizon_Metrics',
+        index=False
+    )
+
+    overall_metrics_df.to_excel(
+        writer,
+        sheet_name='Overall_Metrics',
+        index=False
+    )
+
+    origins_df.to_excel(
+        writer,
+        sheet_name='Forecast_Origins',
+        index=False
+    )
+
+
+print("\n==============================================")
+print("12-WEEK WALK-FORWARD LSTM RESULTS")
+print("==============================================")
+
+print(
+    f"\nResults saved to: {output_file}"
+)
+
+print("\nHorizon-specific metrics:")
+print(metrics_df)
+
+print("\nOverall metrics:")
+print(overall_metrics_df)
+
+
+# ============================================================
+# 16. Plot 1-Week-Ahead Forecast
+# ============================================================
+
+plt.figure(
+    figsize=(14, 6)
+)
+
+h1 = forecast_df[
+    forecast_df['Horizon_Week'] == 1
+]
+
+plt.plot(
+    h1['Forecast_Date'],
+    h1['Actual'],
+    label='Actual'
+)
+
+plt.plot(
+    h1['Forecast_Date'],
+    h1['Forecast'],
+    label='1-Week-Ahead Forecast'
+)
+
+plt.xlabel('Date')
+plt.ylabel(target_column)
+
+plt.title(
+    'LSTM Rolling / Walk-Forward '
+    '1-Week-Ahead Forecast'
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 17. Plot 12-Week-Ahead Forecast
+# ============================================================
+
+plt.figure(
+    figsize=(14, 6)
+)
+
+h12 = forecast_df[
+    forecast_df['Horizon_Week'] == 12
+]
+
+plt.plot(
+    h12['Forecast_Date'],
+    h12['Actual'],
+    label='Actual'
+)
+
+plt.plot(
+    h12['Forecast_Date'],
+    h12['Forecast'],
+    label='12-Week-Ahead Forecast'
+)
+
+plt.xlabel('Date')
+plt.ylabel(target_column)
+
+plt.title(
+    'LSTM Rolling / Walk-Forward '
+    '12-Week-Ahead Forecast'
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
