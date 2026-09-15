@@ -1,0 +1,576 @@
+# ============================================================
+# WALK-FORWARD / ROLLING-ORIGIN LSTM FORECASTING
+# 12-WEEK-AHEAD DIRECT MULTI-STEP FORECAST
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import shap
+import tensorflow as tf
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+from lightgbm import LGBMRegressor
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# ------------------------------------------------------------
+# 1. LOAD DATA
+# ------------------------------------------------------------
+
+file_path = "MGO Forecasting MARCH.csv"
+
+data = pd.read_csv(file_path)
+
+data.columns = data.columns.str.strip()
+
+# Change this if your date column has a different name
+date_col = "Date"
+
+data[date_col] = pd.to_datetime(data[date_col])
+
+data = data.sort_values(date_col).reset_index(drop=True)
+
+# ------------------------------------------------------------
+# 2. BASIC CLEANING
+# ------------------------------------------------------------
+
+# Target = last column
+target_col = data.columns[-1]
+
+feature_cols = [
+    col for col in data.columns
+    if col not in [date_col, target_col]
+]
+
+# Convert numerical variables
+for col in feature_cols + [target_col]:
+    data[col] = pd.to_numeric(data[col], errors="coerce")
+
+# ------------------------------------------------------------
+# IMPORTANT:
+# Do NOT perform interpolation using the complete dataset
+# because this can use future information.
+#
+# Here we only remove rows where the target is missing.
+# Historical feature missing values will be handled
+# separately inside each forecasting origin.
+# ------------------------------------------------------------
+
+data = data.dropna(subset=[target_col]).reset_index(drop=True)
+
+# ------------------------------------------------------------
+# 3. ORIGINAL TRAIN / VALIDATION / TEST SPLIT
+# ------------------------------------------------------------
+
+n = len(data)
+
+train_end = int(n * 0.70)
+validation_end = int(n * 0.80)
+
+train_data = data.iloc[:train_end].copy()
+validation_data = data.iloc[train_end:validation_end].copy()
+test_data = data.iloc[validation_end:].copy()
+
+print("Total observations:", n)
+print("Training observations:", len(train_data))
+print("Validation observations:", len(validation_data))
+print("Test observations:", len(test_data))
+
+# ------------------------------------------------------------
+# 4. COMBINE TRAIN + VALIDATION
+#    Rolling-origin evaluation begins at TEST
+# ------------------------------------------------------------
+
+development_data = pd.concat(
+    [train_data, validation_data],
+    axis=0
+).reset_index(drop=True)
+
+# ------------------------------------------------------------
+# 5. PARAMETERS
+# ------------------------------------------------------------
+
+SEQ_LEN = 24          # 24 previous weeks used as input
+HORIZON = 12          # 12-week-ahead forecast
+STEP = 1              # move forward one week at a time
+
+EPOCHS = 50
+BATCH_SIZE = 32
+
+# Number of historical observations required
+MIN_HISTORY = 100
+
+# ------------------------------------------------------------
+# 6. FUNCTION TO CREATE SEQUENCES
+# ------------------------------------------------------------
+
+def create_sequences(
+    X_data,
+    y_data,
+    seq_len=24,
+    horizon=12
+):
+
+    X = []
+    y = []
+
+    for i in range(seq_len, len(X_data) - horizon + 1):
+
+        X.append(
+            X_data[i-seq_len:i]
+        )
+
+        y.append(
+            y_data[i:i+horizon]
+        )
+
+    return np.array(X), np.array(y)
+
+
+# ------------------------------------------------------------
+# 7. WALK-FORWARD FORECASTING
+# ------------------------------------------------------------
+
+all_forecasts = []
+all_actuals = []
+
+forecast_records = []
+
+# We use the complete development period as the starting
+# historical information.
+
+history = development_data.copy()
+
+# Test observations are revealed sequentially.
+test_start_index = 0
+
+while test_start_index < len(test_data):
+
+    print(
+        f"\nForecast origin {test_start_index + 1} "
+        f"of {len(test_data)}"
+    )
+
+    # --------------------------------------------------------
+    # CURRENT FORECAST ORIGIN
+    # --------------------------------------------------------
+
+    origin_date = test_data.iloc[test_start_index][date_col]
+
+    print("Forecast origin:", origin_date)
+
+    # --------------------------------------------------------
+    # HISTORICAL DATA AVAILABLE AT THIS ORIGIN
+    # --------------------------------------------------------
+
+    historical = history.copy()
+
+    # --------------------------------------------------------
+    # HANDLE MISSING VALUES USING ONLY HISTORICAL DATA
+    # --------------------------------------------------------
+
+    historical[feature_cols] = (
+        historical[feature_cols]
+        .interpolate(method="linear")
+        .bfill()
+        .ffill()
+    )
+
+    historical[target_col] = (
+        historical[target_col]
+        .interpolate(method="linear")
+        .bfill()
+        .ffill()
+    )
+
+    # --------------------------------------------------------
+    # 8. SHAP FEATURE SELECTION
+    #
+    # IMPORTANT:
+    # SHAP uses ONLY information available at this origin.
+    # The future test period is never used.
+    # --------------------------------------------------------
+
+    X_hist = historical[feature_cols]
+    y_hist = historical[target_col]
+
+    # LightGBM for feature importance / SHAP
+    lgb_model = LGBMRegressor(
+        n_estimators=300,
+        learning_rate=0.03,
+        max_depth=6,
+        random_state=42,
+        verbosity=-1
+    )
+
+    lgb_model.fit(X_hist, y_hist)
+
+    explainer = shap.TreeExplainer(lgb_model)
+
+    shap_values = explainer.shap_values(X_hist)
+
+    # Mean absolute SHAP importance
+    shap_importance = pd.DataFrame({
+        "Feature": feature_cols,
+        "Importance": np.mean(
+            np.abs(shap_values),
+            axis=0
+        )
+    })
+
+    shap_importance = (
+        shap_importance
+        .sort_values(
+            "Importance",
+            ascending=False
+        )
+        .reset_index(drop=True)
+    )
+
+    # Select top 5 variables
+    selected_features = (
+        shap_importance
+        .head(5)["Feature"]
+        .tolist()
+    )
+
+    print(
+        "Selected features:",
+        selected_features
+    )
+
+    # --------------------------------------------------------
+    # 9. FIT SCALERS ONLY ON HISTORICAL DATA
+    # --------------------------------------------------------
+
+    X_scaler = MinMaxScaler()
+    y_scaler = MinMaxScaler()
+
+    X_hist_raw = historical[selected_features].values
+    y_hist_raw = historical[[target_col]].values
+
+    X_hist_scaled = X_scaler.fit_transform(
+        X_hist_raw
+    )
+
+    y_hist_scaled = y_scaler.fit_transform(
+        y_hist_raw
+    ).flatten()
+
+    # --------------------------------------------------------
+    # 10. CREATE LSTM TRAINING SEQUENCES
+    # --------------------------------------------------------
+
+    X_train_seq, y_train_seq = create_sequences(
+        X_hist_scaled,
+        y_hist_scaled,
+        seq_len=SEQ_LEN,
+        horizon=HORIZON
+    )
+
+    print(
+        "Training sequences:",
+        X_train_seq.shape
+    )
+
+    # --------------------------------------------------------
+    # 11. BUILD LSTM
+    # --------------------------------------------------------
+
+    tf.keras.backend.clear_session()
+
+    model = Sequential([
+        LSTM(
+            64,
+            return_sequences=True,
+            input_shape=(
+                SEQ_LEN,
+                len(selected_features)
+            )
+        ),
+
+        Dropout(0.2),
+
+        LSTM(32),
+
+        Dropout(0.2),
+
+        Dense(HORIZON)
+    ])
+
+    model.compile(
+        optimizer="adam",
+        loss="mse"
+    )
+
+    # --------------------------------------------------------
+    # 12. TRAIN MODEL
+    # --------------------------------------------------------
+
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=8,
+        restore_best_weights=True
+    )
+
+    # Last 10% of historical sequences used as validation
+    validation_split = 0.10
+
+    model.fit(
+        X_train_seq,
+        y_train_seq,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=validation_split,
+        callbacks=[early_stop],
+        verbose=0,
+        shuffle=False
+    )
+
+    # --------------------------------------------------------
+    # 13. PREPARE THE 24-WEEK INPUT WINDOW
+    # --------------------------------------------------------
+
+    # Need the last 24 historical observations
+    last_history = historical.tail(SEQ_LEN)
+
+    X_last = (
+        last_history[selected_features]
+        .values
+    )
+
+    X_last_scaled = X_scaler.transform(
+        X_last
+    )
+
+    X_last_scaled = X_last_scaled.reshape(
+        1,
+        SEQ_LEN,
+        len(selected_features)
+    )
+
+    # --------------------------------------------------------
+    # 14. 12-WEEK-AHEAD DIRECT FORECAST
+    # --------------------------------------------------------
+
+    forecast_scaled = model.predict(
+        X_last_scaled,
+        verbose=0
+    )
+
+    forecast_scaled = forecast_scaled.reshape(
+        -1, 1
+    )
+
+    forecast = y_scaler.inverse_transform(
+        forecast_scaled
+    ).flatten()
+
+    # --------------------------------------------------------
+    # 15. ACTUAL VALUES
+    #
+    # We forecast 12 weeks ahead, unless fewer than 12
+    # observations remain at the end of the test period.
+    # --------------------------------------------------------
+
+    available_actuals = test_data.iloc[
+        test_start_index:
+        test_start_index + HORIZON
+    ][target_col].values
+
+    available_dates = test_data.iloc[
+        test_start_index:
+        test_start_index + HORIZON
+    ][date_col].values
+
+    forecast = forecast[
+        :len(available_actuals)
+    ]
+
+    # --------------------------------------------------------
+    # 16. STORE RESULTS
+    # --------------------------------------------------------
+
+    for h in range(len(available_actuals)):
+
+        forecast_records.append({
+            "Forecast_Origin": origin_date,
+            "Forecast_Date": available_dates[h],
+            "Horizon_Week": h + 1,
+            "Actual": available_actuals[h],
+            "Forecast": forecast[h]
+        })
+
+    # --------------------------------------------------------
+    # 17. MOVE THE FORECAST ORIGIN FORWARD ONE WEEK
+    # --------------------------------------------------------
+
+    # Reveal the next actual observation to the model.
+    #
+    # This is the key walk-forward step.
+    # The model is RE-ESTIMATED at the next origin.
+    # --------------------------------------------------------
+
+    history = pd.concat(
+        [
+            history,
+            test_data.iloc[
+                test_start_index:
+                test_start_index + STEP
+            ]
+        ],
+        ignore_index=True
+    )
+
+    test_start_index += STEP
+
+
+# ------------------------------------------------------------
+# 18. RESULTS DATAFRAME
+# ------------------------------------------------------------
+
+results = pd.DataFrame(
+    forecast_records
+)
+
+print("\nForecasting completed.")
+
+print(
+    results.head(20)
+)
+
+# ------------------------------------------------------------
+# 19. CALCULATE ACCURACY BY FORECAST HORIZON
+# ------------------------------------------------------------
+
+metrics = []
+
+for h in range(1, HORIZON + 1):
+
+    h_data = results[
+        results["Horizon_Week"] == h
+    ]
+
+    if len(h_data) == 0:
+        continue
+
+    actual = h_data["Actual"].values
+    predicted = h_data["Forecast"].values
+
+    mae = mean_absolute_error(
+        actual,
+        predicted
+    )
+
+    rmse = np.sqrt(
+        mean_squared_error(
+            actual,
+            predicted
+        )
+    )
+
+    # MAPE
+    nonzero = actual != 0
+
+    if np.any(nonzero):
+
+        mape = np.mean(
+            np.abs(
+                (
+                    actual[nonzero]
+                    - predicted[nonzero]
+                )
+                /
+                actual[nonzero]
+            )
+        ) * 100
+
+    else:
+        mape = np.nan
+
+    metrics.append({
+        "Horizon_Week": h,
+        "MAE": mae,
+        "RMSE": rmse,
+        "MAPE": mape,
+        "N_Forecasts": len(h_data)
+    })
+
+metrics_df = pd.DataFrame(metrics)
+
+print("\nAccuracy by forecast horizon:")
+print(metrics_df)
+
+# ------------------------------------------------------------
+# 20. OVERALL ACCURACY
+# ------------------------------------------------------------
+
+overall_actual = results["Actual"].values
+overall_forecast = results["Forecast"].values
+
+overall_mae = mean_absolute_error(
+    overall_actual,
+    overall_forecast
+)
+
+overall_rmse = np.sqrt(
+    mean_squared_error(
+        overall_actual,
+        overall_forecast
+    )
+)
+
+overall_mape = np.mean(
+    np.abs(
+        (
+            overall_actual
+            - overall_forecast
+        )
+        /
+        overall_actual
+    )
+) * 100
+
+print("\nOverall Results")
+print("-------------------------")
+print("MAE :", overall_mae)
+print("RMSE:", overall_rmse)
+print("MAPE:", overall_mape)
+
+# ------------------------------------------------------------
+# 21. SAVE RESULTS
+# ------------------------------------------------------------
+
+with pd.ExcelWriter(
+    "LSTM_SHAP_12week_WalkForward.xlsx"
+) as writer:
+
+    results.to_excel(
+        writer,
+        sheet_name="Forecasts",
+        index=False
+    )
+
+    metrics_df.to_excel(
+        writer,
+        sheet_name="Horizon_Metrics",
+        index=False
+    )
+
+    shap_importance.to_excel(
+        writer,
+        sheet_name="Final_SHAP",
+        index=False
+    )
+
+print(
+    "\nResults saved to "
+    "LSTM_SHAP_12week_WalkForward.xlsx"
+)
