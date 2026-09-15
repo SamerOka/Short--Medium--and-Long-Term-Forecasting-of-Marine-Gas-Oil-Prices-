@@ -1,0 +1,26 @@
+from statsmodels.tsa.stattools import kpss
+import warnings
+
+def check_kpss(timeseries):
+    # Ignore regression warnings for small samples
+    warnings.filterwarnings("ignore")
+    
+    print("--- KPSS Test Results ---")
+    # 'ct' tests for stationarity around a trend (use 'c' for constant only)
+    statistic, p_value, n_lags, critical_values = kpss(timeseries.dropna(), regression='ct')
+    
+    print(f'KPSS Statistic: {statistic:.4f}')
+    print(f'p-value: {p_value:.4f}')
+    print(f'Lags Used: {n_lags}')
+    print('Critical Values:')
+    for key, value in critical_values.items():
+        print(f'   {key}: {value:.4f}')
+
+    # Interpret the p-value 
+    if p_value < 0.05:
+        print("\nResult: The data is NON-STATIONARY (Reject H0).")
+    else:
+        print("\nResult: The data is STATIONARY (Fail to reject H0).")
+
+# Apply to your first-differenced series (d=1)
+check_kpss(series.diff().dropna())
